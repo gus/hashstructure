@@ -555,6 +555,101 @@ func TestHash_ignoreZeroValue(t *testing.T) {
 	}
 }
 
+func TestHash_omitemptyTag(t *testing.T) {
+	tests := []struct {
+		name string
+		val  interface{}
+		want interface{}
+	}{
+		{
+			name: "bool field",
+			val: struct {
+				A bool `hash:"omitempty"`
+			}{},
+			want: struct{}{},
+		},
+		{
+			name: "string field",
+			val: struct {
+				A string `hash:"omitempty"`
+			}{},
+			want: struct{}{},
+		},
+		{
+			name: "int field",
+			val: struct {
+				A int `hash:"omitempty"`
+			}{},
+			want: struct{}{},
+		},
+		{
+			name: "nil slice field",
+			val: struct {
+				A []int `hash:"omitempty"`
+			}{},
+			want: struct{}{},
+		},
+		{
+			name: "nil map field",
+			val: struct {
+				A map[string]int `hash:"omitempty"`
+			}{},
+			want: struct{}{},
+		},
+		{
+			name: "empty slice field",
+			val: struct {
+				A []int `hash:"omitempty"`
+			}{A: []int{}},
+			want: struct{}{},
+		},
+		{
+			name: "empty map field",
+			val: struct {
+				A map[string]int `hash:"omitempty"`
+			}{A: map[string]int{}},
+			want: struct{}{},
+		},
+		{
+			name: "multiple fields, all emitted",
+			val: struct {
+				A bool           `hash:"omitempty"`
+				B map[string]int `hash:"omitempty"`
+				C string         `hash:"omitempty"`
+			}{B: map[string]int{}, C: ""},
+			want: struct{}{},
+		},
+		{
+			name: "multiple fields, some emitted",
+			val: struct {
+				A bool           `hash:"omitempty"`
+				B map[string]int `hash:"omitempty"`
+				C string         `hash:"omitempty"`
+				D int
+			}{B: map[string]int{}, C: "foo"},
+			want: struct {
+				C string
+				D int
+			}{C: "foo", D: 0},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			hashVal, err := Hash(tt.val, testFormat, nil)
+			if err != nil {
+				t.Fatalf("Failed to hash test value %#v: %s", tt.val, err)
+			}
+			hashWant, err := Hash(tt.want, testFormat, nil)
+			if err != nil {
+				t.Fatalf("Failed to hash expected value %#v: %s", tt.want, err)
+			}
+			if hashVal != hashWant {
+				t.Fatalf("expected hash '%d', but got '%d'", hashWant, hashVal)
+			}
+		})
+	}
+}
+
 func TestHash_includableMap(t *testing.T) {
 	cases := []struct {
 		One, Two interface{}
@@ -671,6 +766,57 @@ func TestHash_hashable(t *testing.T) {
 			// Compare
 			if (one == two) != tc.Match {
 				t.Fatalf("bad, expected: %#v\n\n%#v\n\n%#v", tc.Match, tc.One, tc.Two)
+			}
+		})
+	}
+}
+
+type Stringable struct {
+	S interface{}
+}
+
+func (s Stringable) String() string {
+	return fmt.Sprintf("%v", s.S)
+}
+
+func TestHash_multipleTags(t *testing.T) {
+
+	tests := []struct {
+		name string
+		val  interface{}
+		want interface{}
+	}{
+		{
+			name: "ignore takes precedence",
+			val: struct {
+				A bool   `hash:"ignore,omitempty"`
+				B string `hash:"-,string"`
+			}{A: true, B: "foo"},
+			want: struct{}{},
+		},
+		{
+			name: "omitempty and string",
+			val: struct {
+				A Stringable `hash:"omitempty,string"`
+				B Stringable `hash:"string"`
+			}{A: Stringable{""}, B: Stringable{"foo"}},
+			want: struct {
+				B Stringable `hash:"string"`
+			}{B: Stringable{"foo"}},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			hashVal, err := Hash(tt.val, testFormat, nil)
+			if err != nil {
+				t.Fatalf("Failed to hash test value %#v: %s", tt.val, err)
+			}
+			hashWant, err := Hash(tt.want, testFormat, nil)
+			if err != nil {
+				t.Fatalf("Failed to hash expected value %#v: %s", tt.want, err)
+			}
+			if hashVal != hashWant {
+				t.Fatalf("expected hash '%d', but got '%d'", hashWant, hashVal)
 			}
 		})
 	}

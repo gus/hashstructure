@@ -6,6 +6,7 @@ import (
 	"hash"
 	"hash/fnv"
 	"reflect"
+	"strings"
 	"time"
 )
 
@@ -72,29 +73,28 @@ const (
 //
 // Notes on the value:
 //
-//   * Unexported fields on structs are ignored and do not affect the
+//   - Unexported fields on structs are ignored and do not affect the
 //     hash value.
 //
-//   * Adding an exported field to a struct with the zero value will change
+//   - Adding an exported field to a struct with the zero value will change
 //     the hash value.
 //
 // For structs, the hashing can be controlled using tags. For example:
 //
-//    struct {
-//        Name string
-//        UUID string `hash:"ignore"`
-//    }
+//	struct {
+//	    Name string
+//	    UUID string `hash:"ignore"`
+//	}
 //
 // The available tag values are:
 //
-//   * "ignore" or "-" - The field will be ignored and not affect the hash code.
+//   - "ignore" or "-" - The field will be ignored and not affect the hash code.
 //
-//   * "set" - The field will be treated as a set, where ordering doesn't
-//             affect the hash code. This only works for slices.
+//   - "set" - The field will be treated as a set, where ordering doesn't
+//     affect the hash code. This only works for slices.
 //
-//   * "string" - The field will be hashed as a string, only works when the
-//                field implements fmt.Stringer
-//
+//   - "string" - The field will be hashed as a string, only works when the
+//     field implements fmt.Stringer
 func Hash(v interface{}, format Format, opts *HashOptions) (uint64, error) {
 	// Validate our format
 	if format <= formatInvalid || format >= formatMax {
@@ -140,7 +140,7 @@ type walker struct {
 
 type visitOpts struct {
 	// Flags are a bitmask of flags to affect behavior of this visit
-	Flags visitFlag
+	Flags fieldTag
 
 	// Information about the struct containing this field
 	Struct      interface{}
@@ -232,6 +232,10 @@ func (w *walker) visit(v reflect.Value, opts *visitOpts) (uint64, error) {
 		return h, nil
 
 	case reflect.Map:
+		if opts != nil && opts.Flags.Omitempty() && v.Len() == 0 {
+			return 0, nil
+		}
+
 		var includeMap IncludableMap
 		if opts != nil && opts.Struct != nil {
 			if v, ok := opts.Struct.(IncludableMap); ok {
@@ -309,30 +313,23 @@ func (w *walker) visit(v reflect.Value, opts *visitOpts) (uint64, error) {
 		l := v.NumField()
 		for i := 0; i < l; i++ {
 			if innerV := v.Field(i); v.CanSet() || t.Field(i).Name != "_" {
-				var f visitFlag
+				// var f visitFlag
 				fieldType := t.Field(i)
 				if fieldType.PkgPath != "" {
-					// Unexported
+					continue // unexported
+				}
+
+				tag := parseFieldTag(fieldType.Tag.Get(w.tag))
+				if tag.Ignore() {
+					// explicitly ignore this field
 					continue
 				}
 
-				tag := fieldType.Tag.Get(w.tag)
-				if tag == "ignore" || tag == "-" {
-					// Ignore this field
-					continue
-				}
-
-				if w.ignorezerovalue {
-					if innerV.IsZero() {
-						continue
-					}
-				}
-
-				// if string is set, use the string value
-				if tag == "string" || w.stringer {
+				if tag.Stringer() || w.stringer {
+					// if string is set, use the string value
 					if impl, ok := innerV.Interface().(fmt.Stringer); ok {
 						innerV = reflect.ValueOf(impl.String())
-					} else if tag == "string" {
+					} else if tag.Stringer() {
 						// We only show this error if the tag explicitly
 						// requests a stringer.
 						return 0, &ErrNotStringer{
@@ -341,20 +338,30 @@ func (w *walker) visit(v reflect.Value, opts *visitOpts) (uint64, error) {
 					}
 				}
 
+				if (w.ignorezerovalue || tag.Omitempty()) && innerV.IsZero() {
+					// ignore/omit this field because it has a zero value
+					continue
+				}
+
 				// Check if we implement includable and check it
 				if include != nil {
 					incl, err := include.HashInclude(fieldType.Name, innerV)
 					if err != nil {
 						return 0, err
-					}
-					if !incl {
+					} else if !incl {
 						continue
 					}
 				}
 
-				switch tag {
-				case "set":
-					f |= visitFlagSet
+				vh, err := w.visit(innerV, &visitOpts{
+					Flags:       tag,
+					Struct:      parent,
+					StructField: fieldType.Name,
+				})
+				if err != nil {
+					return 0, err
+				} else if vh == 0 && tag.Omitempty() {
+					continue
 				}
 
 				kh, err := w.visit(reflect.ValueOf(fieldType.Name), nil)
@@ -362,17 +369,7 @@ func (w *walker) visit(v reflect.Value, opts *visitOpts) (uint64, error) {
 					return 0, err
 				}
 
-				vh, err := w.visit(innerV, &visitOpts{
-					Flags:       f,
-					Struct:      parent,
-					StructField: fieldType.Name,
-				})
-				if err != nil {
-					return 0, err
-				}
-
-				fieldHash := hashUpdateOrdered(w.h, kh, vh)
-				h = hashUpdateUnordered(h, fieldHash)
+				h = hashUpdateUnordered(h, hashUpdateOrdered(w.h, kh, vh))
 			}
 
 			if w.format != FormatV1 {
@@ -388,10 +385,8 @@ func (w *walker) visit(v reflect.Value, opts *visitOpts) (uint64, error) {
 		// visit all the elements. If it is a set, then we do a deterministic
 		// hash code.
 		var h uint64
-		var set bool
-		if opts != nil {
-			set = (opts.Flags & visitFlagSet) != 0
-		}
+		set := opts != nil && opts.Flags.IsSet()
+
 		l := v.Len()
 		for i := 0; i < l; i++ {
 			current, err := w.visit(v.Index(i), nil)
@@ -425,6 +420,39 @@ func (w *walker) visit(v reflect.Value, opts *visitOpts) (uint64, error) {
 
 }
 
+type fieldTag uint
+
+func (ft fieldTag) IsValid() bool   { return ft > fieldTagInvalid }
+func (ft fieldTag) IsSet() bool     { return ft&fieldTagSet > 0 }
+func (ft fieldTag) Omitempty() bool { return ft&fieldTagOmitempty > 0 }
+func (ft fieldTag) Ignore() bool    { return ft&fieldTagIgnore > 0 }
+func (ft fieldTag) Stringer() bool  { return ft&fieldTagStringer > 0 }
+
+const (
+	fieldTagInvalid   fieldTag = 0
+	fieldTagSet                = 1
+	fieldTagOmitempty          = 1 << 1
+	fieldTagIgnore             = 1 << 2
+	fieldTagStringer           = 1 << 3
+)
+
+func parseFieldTag(tagVal string) fieldTag {
+	ft := fieldTagInvalid
+	for _, flag := range strings.Split(tagVal, ",") {
+		switch flag {
+		case "set":
+			ft |= fieldTagSet
+		case "omitempty":
+			ft |= fieldTagOmitempty
+		case "ignore", "-":
+			ft |= fieldTagIgnore
+		case "string":
+			ft |= fieldTagStringer
+		}
+	}
+	return ft
+}
+
 func hashUpdateOrdered(h hash.Hash64, a, b uint64) uint64 {
 	// For ordered updates, use a real hash function
 	h.Reset()
@@ -453,11 +481,11 @@ func hashUpdateUnordered(a, b uint64) uint64 {
 // hashUpdateUnordered can effectively cancel out a previous change to the hash
 // result if the same hash value appears later on. For example, consider:
 //
-//   hashUpdateUnordered(hashUpdateUnordered("A", "B"), hashUpdateUnordered("A", "C")) =
-//   H("A") ^ H("B")) ^ (H("A") ^ H("C")) =
-//   (H("A") ^ H("A")) ^ (H("B") ^ H(C)) =
-//   H(B) ^ H(C) =
-//   hashUpdateUnordered(hashUpdateUnordered("Z", "B"), hashUpdateUnordered("Z", "C"))
+//	hashUpdateUnordered(hashUpdateUnordered("A", "B"), hashUpdateUnordered("A", "C")) =
+//	H("A") ^ H("B")) ^ (H("A") ^ H("C")) =
+//	(H("A") ^ H("A")) ^ (H("B") ^ H(C)) =
+//	H(B) ^ H(C) =
+//	hashUpdateUnordered(hashUpdateUnordered("Z", "B"), hashUpdateUnordered("Z", "C"))
 //
 // hashFinishUnordered "hardens" the result, so that encountering partially
 // overlapping input data later on in a different context won't cancel out.
@@ -472,11 +500,3 @@ func hashFinishUnordered(h hash.Hash64, a uint64) uint64 {
 
 	return h.Sum64()
 }
-
-// visitFlag is used as a bitmask for affecting visit behavior
-type visitFlag uint
-
-const (
-	visitFlagInvalid visitFlag = iota
-	visitFlagSet               = iota << 1
-)

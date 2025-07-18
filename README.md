@@ -25,6 +25,9 @@ sending data across the network, caching values locally (de-dup), and so on.
 
   * Optionally, override the hashing process by implementing `Hashable`.
 
+  * Tag any struct field with `omitempty` to ignore fields whose values are the
+    zero-value or generally considered "empty".
+
 ## Installation
 
 Standard `go get`:
